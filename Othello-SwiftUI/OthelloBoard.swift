@@ -1,6 +1,14 @@
 import ScrechKit
 
 struct OthelloBoard: View {
+    enum GameMode: String, CaseIterable, Identifiable {
+        case humanVsHuman = "Human vs Human",
+             humanVsAI = "Human vs AI",
+             aiVsAI = "AI vs AI"
+        
+        var id: String { rawValue }
+    }
+    
     @State private var board = Array(repeating: CellState.empty, count: 64)
     
     private let rows = 8
@@ -9,6 +17,26 @@ struct OthelloBoard: View {
     @State private var showAlert = false
     @State private var showWarning = false
     @State private var winner: CellState?
+    
+    @State private var currentPlayer: CellState = .black
+    
+    @State private var gameMode: GameMode = .humanVsAI
+    @State private var aiPlayer: CellState = .white
+    @State private var aiDepth = 3
+    @State private var isAIMoving = false
+    @State private var gameId = 0
+    
+    private let directions = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+    private let positionWeights = [
+        120, -20, 20, 5, 5, 20, -20, 120,
+        -20, -40, -5, -5, -5, -5, -40, -20,
+        20, -5, 15, 3, 3, 15, -5, 20,
+        5, -5, 3, 3, 3, 3, -5, 5,
+        5, -5, 3, 3, 3, 3, -5, 5,
+        20, -5, 15, 3, 3, 15, -5, 20,
+        -20, -40, -5, -5, -5, -5, -40, -20,
+        120, -20, 20, 5, 5, 20, -20, 120
+    ]
     
     var body: some View {
         VStack {
@@ -20,6 +48,34 @@ struct OthelloBoard: View {
                 .largeTitle(.bold)
                 .foregroundColor(.white)
             
+            VStack(spacing: 12) {
+                Picker("Mode", selection: $gameMode) {
+                    ForEach(GameMode.allCases) {
+                        Text($0.rawValue).tag($0)
+                    }
+                }
+                .pickerStyle(.segmented)
+                
+                if gameMode == .humanVsAI {
+                    Picker("AI Plays", selection: $aiPlayer) {
+                        Text("Black").tag(CellState.black)
+                        Text("White").tag(CellState.white)
+                    }
+                    .pickerStyle(.segmented)
+                }
+                
+                Stepper("AI Depth: \(aiDepth)", value: $aiDepth, in: 1...10)
+                    .foregroundColor(.white)
+            }
+            .padding(.horizontal)
+            .padding(.bottom, 10)
+            .onChange(of: gameMode) {
+                startNewgame()
+            }
+            .onChange(of: aiPlayer) {
+                startNewgame()
+            }
+            
             VStack {
                 Text("Current Score")
                     .title3(.bold)
@@ -27,7 +83,7 @@ struct OthelloBoard: View {
                     .offset(y: 80)
                 
                 HStack {
-                    let scores = countPieces()
+                    let scores = countPieces(on: board)
                     
                     Text("Black: \(scores.black)")
                     
@@ -39,13 +95,13 @@ struct OthelloBoard: View {
                 .foregroundColor(.white)
                 .offset(y: 85)
                 
-                // Game Board
                 GeometryReader { geo in
                     let gridSize = min(geo.size.width, geo.size.height) * 0.9
                     let cellSize = gridSize / CGFloat(max(rows, columns))
                     
                     let xOffset = (geo.size.width - gridSize) / 2
                     let yOffset = (geo.size.height - gridSize) / 2
+                    let currentValidMoves = validMoves(for: currentPlayer, on: board)
                     
                     ForEach(0..<64, id: \.self) { index in
                         Path { path in
@@ -57,6 +113,7 @@ struct OthelloBoard: View {
                         .stroke(.black, lineWidth: 3)
                         .fill(.green)
                         .onTapGesture {
+                            guard isHumanTurn else { return }
                             place(at: index)
                         }
                         
@@ -68,7 +125,7 @@ struct OthelloBoard: View {
                                     x: CGFloat(index % columns) * cellSize + xOffset + cellSize / 2,
                                     y: CGFloat(index / columns) * cellSize + yOffset + cellSize / 2
                                 )
-                        } else if validMoves().contains(index) {
+                        } else if currentValidMoves.contains(index) {
                             Circle()
                                 .fill(currentPlayer == .black ? Color.black.opacity(0.5) : Color.white.opacity(0.5))
                                 .frame(cellSize * 0.3)
@@ -86,15 +143,12 @@ struct OthelloBoard: View {
                 }
                 .alert(winnerMessage(), isPresented: $showAlert) {
                     Button("View Board", role: .cancel) {}
-                    
-                    Button("Play Again", role: .destructive) {
-                        startNewgame()
-                    }
+                    Button("Play Again", role: .destructive, action: startNewgame)
                 }
                 .padding()
             }
             
-            Text("It is currently \(currentPlayer == .black ? "BLACK" : "WHITE")'s move...")
+            Text("It is currently \(currentPlayer.displayName)'s move...")
                 .bold()
                 .italic()
                 .foregroundStyle(.white)
@@ -105,10 +159,7 @@ struct OthelloBoard: View {
                 showWarning = true
             }
             .alert("Are you sure?", isPresented: $showWarning) {
-                Button("New Game", role: .destructive) {
-                    startNewgame()
-                }
-                
+                Button("New Game", role: .destructive, action: startNewgame)
                 Button("Cancel", role: .cancel) {}
             }
             .foregroundStyle(.white)
@@ -118,16 +169,25 @@ struct OthelloBoard: View {
         .background(.black)
     }
     
-    // Keep track of turns
-    @State var currentPlayer: CellState = .black
+    private var isHumanTurn: Bool {
+        switch gameMode {
+        case .humanVsHuman: true
+        case .humanVsAI: currentPlayer != aiPlayer
+        case .aiVsAI: false
+        }
+    }
     
-    // Look at all 8 directions ( used in isValidMove() and flipOppPieces() )
-    let directions = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+    private var isAITurn: Bool {
+        switch gameMode {
+        case .humanVsHuman: false
+        case .humanVsAI: currentPlayer == aiPlayer
+        case .aiVsAI: true
+        }
+    }
     
     func startNewgame() {
         board = Array(repeating: .empty, count: 64)
         
-        // Setup board start state
         let midpoint = rows / 2
         board[(midpoint - 1) * columns + (midpoint - 1)] = .white
         board[(midpoint - 1) * columns + midpoint] = .black
@@ -136,110 +196,109 @@ struct OthelloBoard: View {
         
         currentPlayer = .black
         showAlert = false
+        winner = nil
+        isAIMoving = false
+        gameId += 1
+        triggerAIMoveIfNeeded()
     }
     
     func place(at index: Int) {
-        // Check validity
-        if isValidMove(at: index) {
-            board[index] = currentPlayer
-            flipOppPieces(from: index)
-            
-            // Switch player
-            currentPlayer = currentPlayer.toggle()
-            
-            if isGameOver() {
-                winner = isWinner()
-                showAlert = true
-            }
+        applyMove(at: index, player: currentPlayer)
+    }
+    
+    func applyMove(at index: Int, player: CellState) {
+        guard isValidMove(at: index, player: player, on: board) else { return }
+        board = boardAfterMove(at: index, player: player, on: board)
+        currentPlayer = player.toggle()
+        postMove()
+    }
+    
+    func postMove() {
+        resolveNoMoves()
+        if showAlert { return }
+        triggerAIMoveIfNeeded()
+    }
+    
+    func resolveNoMoves() {
+        guard !hasAnyMove(for: currentPlayer, on: board) else { return }
+        let otherPlayer = currentPlayer.toggle()
+        
+        if hasAnyMove(for: otherPlayer, on: board) {
+            currentPlayer = otherPlayer
+        } else {
+            finishGame()
         }
     }
     
-    func isValidMove(at index: Int) -> Bool {
-        guard board[index] == .empty else { return false }
+    func finishGame() {
+        winner = winnerFor(board)
+        showAlert = true
+    }
+    
+    func triggerAIMoveIfNeeded() {
+        guard !showAlert else { return }
+        resolveNoMoves()
+        guard !showAlert else { return }
+        guard isAITurn else { return }
+        guard !isAIMoving else { return }
         
-        let oppColor = currentPlayer.toggle()
-        var isValid = false
+        let currentGameId = gameId
+        let player = currentPlayer
+        let depth = aiDepth
+        let boardSnapshot = board
         
-        // Convert the index to (row, col)
-        let row = index / columns
-        let col = index % columns
+        isAIMoving = true
         
-        for direction in directions {
-            var currentRow = row + direction.0
-            var currentCol = col + direction.1
+        Task.detached {
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            let move = await OthelloEngine.bestMoveParallel(for: player, depth: depth, on: boardSnapshot)
             
-            // Keep track of if there is an opponent piece
-            var seenOppPiece = false
-            
-            // While in bounds of the board
-            while currentRow >= 0 && currentRow < rows && currentCol >= 0 && currentCol < columns {
-                let currentIndex = currentRow * columns + currentCol
-                
-                // Break at an empty cell
-                if board[currentIndex] == .empty { break }
-                
-                // At opponent piece, set seenOppPiece to true, continue
-                if board[currentIndex] == oppColor {
-                    seenOppPiece = true
+            await MainActor.run {
+                guard currentGameId == gameId else {
+                    isAIMoving = false
+                    return
                 }
                 
-                // If opponent piece is found followed by current player color, move is valid
-                else if seenOppPiece {
-                    isValid = true
-                    break
+                guard currentPlayer == player else {
+                    isAIMoving = false
+                    return
+                }
+                
+                isAIMoving = false
+                
+                if let move {
+                    applyMove(at: move, player: player)
                 } else {
-                    // If current player's color is immediately found, it is not a valid move
-                    break
+                    currentPlayer = player.toggle()
+                    postMove()
                 }
-                
-                // Check the next cell in direction
-                currentRow += direction.0
-                currentCol += direction.1
-            }
-            
-            if isValid { break }
-        }
-        
-        return isValid
-    }
-    
-    func flipOppPieces(from index: Int) {
-        let oppColor = currentPlayer.toggle()
-        
-        // Convert the index to (row, col)
-        let row = index / columns
-        let col = index % columns
-        
-        for direction in directions {
-            var cellsToFlip: [Int] = []
-            var currentRow = row + direction.0
-            var currentCol = col + direction.1
-            
-            // While in bounds of the board
-            while currentRow >= 0 && currentRow < rows && currentCol >= 0 && currentCol < columns {
-                let currentIndex = currentRow * columns + currentCol
-                
-                // If opponent piece is seen add it to array of cells to flip
-                if board[currentIndex] == oppColor {
-                    cellsToFlip.append(currentIndex)
-                } else if board[currentIndex] == currentPlayer {
-                    // If current player's color is seen, flip collected opponent pieces
-                    for flipIndex in cellsToFlip {
-                        board[flipIndex] = currentPlayer
-                    }
-                    
-                    break
-                } else {
-                    break
-                }
-                
-                currentRow += direction.0
-                currentCol += direction.1
             }
         }
     }
     
-    func countPieces() -> (black: Int, white: Int) {
+    func validMoves(for player: CellState, on board: [CellState]) -> [Int] {
+        let position = OthelloEngine.position(from: board)
+        let moves = OthelloEngine.legalMoves(player: player, position: position)
+        return OthelloEngine.moveIndices(from: moves)
+    }
+    
+    func hasAnyMove(for player: CellState, on board: [CellState]) -> Bool {
+        let position = OthelloEngine.position(from: board)
+        return OthelloEngine.legalMoves(player: player, position: position) != 0
+    }
+    
+    func isValidMove(at index: Int, player: CellState, on board: [CellState]) -> Bool {
+        let position = OthelloEngine.position(from: board)
+        return OthelloEngine.isValidMove(index: index, player: player, position: position)
+    }
+    
+    func boardAfterMove(at index: Int, player: CellState, on board: [CellState]) -> [CellState] {
+        let position = OthelloEngine.position(from: board)
+        let next = OthelloEngine.applying(moveIndex: index, player: player, position: position)
+        return OthelloEngine.board(from: next)
+    }
+    
+    func countPieces(on board: [CellState]) -> (black: Int, white: Int) {
         var black = 0
         var white = 0
         
@@ -254,41 +313,119 @@ struct OthelloBoard: View {
         return (black, white)
     }
     
-    func isGameOver() -> Bool {
-        let allIndexes = Array(board.indices)
+    func winnerFor(_ board: [CellState]) -> CellState? {
+        let counts = countPieces(on: board)
         
-        let hasMove = allIndexes.contains {
-            isValidMove(at: $0)
-        }
-        
-        return !hasMove
-    }
-    
-    func isWinner() -> CellState? {
-        let (blackCount, whiteCount) = countPieces()
-        
-        if blackCount > whiteCount {
+        if counts.black > counts.white {
             return .black
-        } else if whiteCount > blackCount {
-            return .white
-        } else {
-            return nil
         }
+        
+        if counts.white > counts.black {
+            return .white
+        }
+        
+        return nil
     }
     
     func winnerMessage() -> String {
-        if let winner = isWinner() {
-            "\(winner) wins!"
+        if let winner {
+            "\(winner.displayName) wins!"
         } else {
             "It's a tie!"
         }
     }
     
-    func validMoves() -> [Int] {
-        let moves = Array(board.indices)
+    func isGameOver(on board: [CellState]) -> Bool {
+        hasAnyMove(for: .black, on: board) == false && hasAnyMove(for: .white, on: board) == false
+    }
+    
+    func evaluate(board: [CellState], for player: CellState) -> Int {
+        var score = 0
         
-        return moves.filter {
-            isValidMove(at: $0)
+        for index in board.indices {
+            switch board[index] {
+            case player:
+                score += positionWeights[index]
+                
+            case player.toggle():
+                score -= positionWeights[index]
+                
+            default:
+                break
+            }
+        }
+        
+        let mobility = validMoves(for: player, on: board).count - validMoves(for: player.toggle(), on: board).count
+        score += mobility * 4
+        
+        let counts = countPieces(on: board)
+        let pieceDiff = player == .black ? (counts.black - counts.white) : (counts.white - counts.black)
+        score += pieceDiff
+        
+        return score
+    }
+    
+    func bestMove(for player: CellState, depth: Int, on board: [CellState]) -> Int? {
+        let moves = validMoves(for: player, on: board)
+        guard moves.isEmpty == false else { return nil }
+        
+        var bestScore = Int.min
+        var bestMove: Int?
+        var alpha = Int.min / 2
+        let beta = Int.max / 2
+        
+        for move in moves {
+            let nextBoard = boardAfterMove(at: move, player: player, on: board)
+            let score = minimax(board: nextBoard, player: player.toggle(), depth: depth - 1, aiPlayer: player, alpha: alpha, beta: beta)
+            
+            if score > bestScore {
+                bestScore = score
+                bestMove = move
+            }
+            
+            alpha = max(alpha, bestScore)
+        }
+        
+        return bestMove
+    }
+    
+    func minimax(board: [CellState], player: CellState, depth: Int, aiPlayer: CellState, alpha: Int, beta: Int) -> Int {
+        if depth <= 0 || isGameOver(on: board) {
+            return evaluate(board: board, for: aiPlayer)
+        }
+        
+        let moves = validMoves(for: player, on: board)
+        
+        if moves.isEmpty {
+            return minimax(board: board, player: player.toggle(), depth: depth - 1, aiPlayer: aiPlayer, alpha: alpha, beta: beta)
+        }
+        
+        if player == aiPlayer {
+            var value = Int.min
+            var localAlpha = alpha
+            
+            for move in moves {
+                let nextBoard = boardAfterMove(at: move, player: player, on: board)
+                let score = minimax(board: nextBoard, player: player.toggle(), depth: depth - 1, aiPlayer: aiPlayer, alpha: localAlpha, beta: beta)
+                value = max(value, score)
+                localAlpha = max(localAlpha, value)
+                if localAlpha >= beta { break }
+            }
+            
+            return value
+        } else {
+            var value = Int.max
+            var localBeta = beta
+            
+            for move in moves {
+                let nextBoard = boardAfterMove(at: move, player: player, on: board)
+                let score = minimax(board: nextBoard, player: player.toggle(), depth: depth - 1, aiPlayer: aiPlayer, alpha: alpha, beta: localBeta)
+                value = min(value, score)
+                localBeta = min(localBeta, value)
+                if alpha >= localBeta { break }
+            }
+            
+            return value
         }
     }
 }
