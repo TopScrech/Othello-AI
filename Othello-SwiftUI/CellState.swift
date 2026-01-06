@@ -18,10 +18,8 @@ enum CellState: Hashable {
     }
 }
 
-extension CellState: Sendable {}
-
 struct OthelloEngine {
-    static let positionWeights: [Int] = [
+    static let positionWeights = [
         120, -20, 20, 5, 5, 20, -20, 120,
         -20, -40, -5, -5, -5, -5, -40, -20,
         20, -5, 15, 3, 3, 15, -5, 20,
@@ -33,7 +31,9 @@ struct OthelloEngine {
     ]
     
     static let moveOrder: [Int] = {
-        (0..<64).sorted { positionWeights[$0] > positionWeights[$1] }
+        (0..<64).sorted {
+            positionWeights[$0] > positionWeights[$1]
+        }
     }()
     
     static let notA: UInt64 = 0xfefefefefefefefe
@@ -519,6 +519,7 @@ struct OthelloEngine {
         
         for idx in moveOrder {
             let mb = bit(idx)
+            
             guard (remaining & mb) != 0 else { continue }
             remaining &= ~mb
             
@@ -548,9 +549,10 @@ struct OthelloEngine {
     static func bestMoveParallel(for player: CellState, depth: Int, on board: [CellState]) async -> Int? {
         let position = position(from: board)
         let moves = legalMoves(player: player, position: position)
-        guard moves != 0 else { return nil }
         
+        guard moves != 0 else { return nil }
         let moveCount = moves.nonzeroBitCount
+        
         if moveCount < 4 || depth <= 2 {
             return bestMoveSerial(for: player, depth: depth, position: position, moves: moves)
         }
@@ -560,6 +562,7 @@ struct OthelloEngine {
         
         return await withTaskGroup(of: (Int, Int).self) { group in
             var remaining = moves
+            
             for idx in moveOrder {
                 let mb = bit(idx)
                 guard (remaining & mb) != 0 else { continue }
