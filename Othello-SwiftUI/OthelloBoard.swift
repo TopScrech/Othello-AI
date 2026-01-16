@@ -1,3 +1,4 @@
+import Foundation
 import ScrechKit
 
 struct OthelloBoard: View {
@@ -6,6 +7,13 @@ struct OthelloBoard: View {
              humanVsAI = "Human vs AI",
              aiVsAI = "AI vs AI"
         
+        var id: String { rawValue }
+    }
+
+    enum AIType: String, CaseIterable, Identifiable {
+        case classic = "Classic (Depth)"
+        case timed = "Timed (Seconds)"
+
         var id: String { rawValue }
     }
     
@@ -23,6 +31,12 @@ struct OthelloBoard: View {
     @State private var gameMode: GameMode = .humanVsAI
     @State private var aiPlayer: CellState = .white
     @State private var aiDepth = 3
+    @State private var aiTimeSeconds = 9
+    @State private var aiType: AIType = .timed
+    @State private var aiBlackType: AIType = .classic
+    @State private var aiWhiteType: AIType = .timed
+    @State private var maxThinkTimeBlack: Double = 0
+    @State private var maxThinkTimeWhite: Double = 0
     @State private var isAIMoving = false
     @State private var gameId = 0
     
@@ -62,10 +76,47 @@ struct OthelloBoard: View {
                         Text("White").tag(CellState.white)
                     }
                     .pickerStyle(.segmented)
+
+                    Picker("AI Type", selection: $aiType) {
+                        ForEach(AIType.allCases) {
+                            Text($0.rawValue).tag($0)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
+                    if aiType == .classic {
+                        Stepper("AI Depth: \(aiDepth)", value: $aiDepth, in: 1...10)
+                            .foregroundColor(.white)
+                    } else {
+                        Stepper("AI Time: \(aiTimeSeconds)s", value: $aiTimeSeconds, in: 1...30)
+                            .foregroundColor(.white)
+                    }
                 }
-                
-                Stepper("AI Depth: \(aiDepth)", value: $aiDepth, in: 1...10)
-                    .foregroundColor(.white)
+
+                if gameMode == .aiVsAI {
+                    VStack(spacing: 8) {
+                        Picker("Black AI", selection: $aiBlackType) {
+                            ForEach(AIType.allCases) {
+                                Text($0.rawValue).tag($0)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+
+                        Picker("White AI", selection: $aiWhiteType) {
+                            ForEach(AIType.allCases) {
+                                Text($0.rawValue).tag($0)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+
+                        HStack {
+                            Stepper("Depth: \(aiDepth)", value: $aiDepth, in: 1...10)
+                                .foregroundColor(.white)
+                            Stepper("Time: \(aiTimeSeconds)s", value: $aiTimeSeconds, in: 1...30)
+                                .foregroundColor(.white)
+                        }
+                    }
+                }
             }
             .padding(.horizontal)
             .padding(.bottom, 10)
@@ -73,6 +124,15 @@ struct OthelloBoard: View {
                 startNewgame()
             }
             .onChange(of: aiPlayer) {
+                startNewgame()
+            }
+            .onChange(of: aiType) {
+                startNewgame()
+            }
+            .onChange(of: aiBlackType) {
+                startNewgame()
+            }
+            .onChange(of: aiWhiteType) {
                 startNewgame()
             }
             
@@ -93,6 +153,16 @@ struct OthelloBoard: View {
                 }
                 .title2()
                 .foregroundColor(.white)
+                .offset(y: 85)
+
+                HStack {
+                    Text("Max Think")
+                    Text("B \(timeString(maxThinkTimeBlack))")
+                    Text(" | ")
+                    Text("W \(timeString(maxThinkTimeWhite))")
+                }
+                .title3()
+                .foregroundColor(.white.opacity(0.9))
                 .offset(y: 85)
                 
                 GeometryReader { geo in
@@ -184,6 +254,17 @@ struct OthelloBoard: View {
         case .aiVsAI: true
         }
     }
+
+    private func aiType(for player: CellState) -> AIType {
+        switch gameMode {
+        case .humanVsAI:
+            return aiType
+        case .aiVsAI:
+            return player == .black ? aiBlackType : aiWhiteType
+        case .humanVsHuman:
+            return .classic
+        }
+    }
     
     func startNewgame() {
         board = Array(repeating: .empty, count: 64)
@@ -199,6 +280,8 @@ struct OthelloBoard: View {
         winner = nil
         isAIMoving = false
         gameId += 1
+        maxThinkTimeBlack = 0
+        maxThinkTimeWhite = 0
         triggerAIMoveIfNeeded()
     }
     
@@ -245,14 +328,25 @@ struct OthelloBoard: View {
         let currentGameId = gameId
         let player = currentPlayer
         let depth = aiDepth
+        let timeSeconds = aiTimeSeconds
+        let selectedAIType = aiType(for: player)
         let boardSnapshot = board
         
         isAIMoving = true
         
         Task.detached {
             try? await Task.sleep(nanoseconds: 250_000_000)
-            let move = await OthelloEngine.bestMoveParallel(for: player, depth: depth, on: boardSnapshot)
-            
+            let startTime = DispatchTime.now().uptimeNanoseconds
+            let move: Int?
+
+            switch selectedAIType {
+            case .classic:
+                move = await OthelloEngine.bestMoveParallel(for: player, depth: depth, on: boardSnapshot)
+            case .timed:
+                move = await OthelloEngine.bestMoveTimed(for: player, on: boardSnapshot, seconds: TimeInterval(timeSeconds))
+            }
+            let elapsedSeconds = Double(DispatchTime.now().uptimeNanoseconds - startTime) / 1_000_000_000
+
             await MainActor.run {
                 guard currentGameId == gameId else {
                     isAIMoving = false
@@ -263,9 +357,10 @@ struct OthelloBoard: View {
                     isAIMoving = false
                     return
                 }
-                
+
                 isAIMoving = false
-                
+                updateMaxThinkTime(for: player, elapsed: elapsedSeconds)
+
                 if let move {
                     applyMove(at: move, player: player)
                 } else {
@@ -337,6 +432,18 @@ struct OthelloBoard: View {
     
     func isGameOver(on board: [CellState]) -> Bool {
         hasAnyMove(for: .black, on: board) == false && hasAnyMove(for: .white, on: board) == false
+    }
+
+    func updateMaxThinkTime(for player: CellState, elapsed: Double) {
+        if player == .black {
+            maxThinkTimeBlack = max(maxThinkTimeBlack, elapsed)
+        } else if player == .white {
+            maxThinkTimeWhite = max(maxThinkTimeWhite, elapsed)
+        }
+    }
+
+    func timeString(_ seconds: Double) -> String {
+        String(format: "%.2fs", seconds)
     }
     
     func evaluate(board: [CellState], for player: CellState) -> Int {

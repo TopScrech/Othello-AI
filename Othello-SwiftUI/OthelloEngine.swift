@@ -1,4 +1,5 @@
 import Foundation
+import Dispatch
 
 struct OthelloEngine {
     static let positionWeights = [
@@ -374,6 +375,28 @@ struct OthelloEngine {
         var flag: TTFlag
         var bestMove: Int
     }
+
+    struct SearchDeadline: Sendable {
+        var uptimeNanoseconds: UInt64
+    }
+
+    @inline(__always)
+    static func makeDeadline(seconds: TimeInterval) -> SearchDeadline {
+        let now = DispatchTime.now().uptimeNanoseconds
+        let delta = UInt64(max(0, seconds) * 1_000_000_000)
+        return SearchDeadline(uptimeNanoseconds: now + delta)
+    }
+
+    @inline(__always)
+    static func isExpired(_ deadline: SearchDeadline) -> Bool {
+        DispatchTime.now().uptimeNanoseconds >= deadline.uptimeNanoseconds
+    }
+
+    @inline(__always)
+    static func remainingNanoseconds(until deadline: SearchDeadline) -> UInt64 {
+        let now = DispatchTime.now().uptimeNanoseconds
+        return deadline.uptimeNanoseconds > now ? (deadline.uptimeNanoseconds - now) : 0
+    }
     
     static func search(position: Position, player: CellState, depth: Int, aiPlayer: CellState, alpha: Int, beta: Int, tt: inout [TTKey: TTEntry]) -> Int {
         if depth <= 0 {
@@ -486,6 +509,136 @@ struct OthelloEngine {
         
         return bestScore
     }
+
+    static func searchTimed(position: Position, player: CellState, depth: Int, aiPlayer: CellState, alpha: Int, beta: Int, tt: inout [TTKey: TTEntry], deadline: SearchDeadline, didTimeout: inout Bool) -> Int {
+        if didTimeout || Task.isCancelled || isExpired(deadline) {
+            didTimeout = true
+            return evaluate(position: position, for: aiPlayer)
+        }
+
+        if depth <= 0 {
+            return evaluate(position: position, for: aiPlayer)
+        }
+
+        var a = alpha
+        var b = beta
+
+        let key = TTKey(black: position.black, white: position.white, playerIsBlack: player == .black)
+        let cached = tt[key]
+
+        if let cached, cached.depth >= depth {
+            switch cached.flag {
+            case .exact:
+                return cached.score
+
+            case .lower:
+                a = max(a, cached.score)
+
+            case .upper:
+                b = min(b, cached.score)
+            }
+
+            if a >= b {
+                return cached.score
+            }
+        }
+
+        let moves = legalMoves(player: player, position: position)
+
+        if moves == 0 {
+            let oppMoves = legalMoves(player: player.toggle(), position: position)
+
+            if oppMoves == 0 {
+                return terminalScore(position: position, aiPlayer: aiPlayer)
+            }
+
+            return searchTimed(position: position, player: player.toggle(), depth: depth - 1, aiPlayer: aiPlayer, alpha: a, beta: b, tt: &tt, deadline: deadline, didTimeout: &didTimeout)
+        }
+
+        let a0 = a
+        let b0 = b
+
+        var bestMove = -1
+        var bestScore = player == aiPlayer ? Int.min : Int.max
+
+        if let cached, (moves & bit(cached.bestMove)) != 0 {
+            let idx = cached.bestMove
+            let next = applying(moveIndex: idx, player: player, position: position)
+            let score = searchTimed(position: next, player: player.toggle(), depth: depth - 1, aiPlayer: aiPlayer, alpha: a, beta: b, tt: &tt, deadline: deadline, didTimeout: &didTimeout)
+
+            bestMove = idx
+            bestScore = score
+
+            if player == aiPlayer {
+                a = max(a, bestScore)
+            } else {
+                b = min(b, bestScore)
+            }
+
+            if didTimeout {
+                return bestScore
+            }
+        }
+
+        var remaining = moves
+
+        if bestMove != -1 {
+            remaining &= ~bit(bestMove)
+        }
+
+        for idx in moveOrder {
+            if didTimeout || Task.isCancelled || isExpired(deadline) {
+                didTimeout = true
+                return bestScore
+            }
+
+            let moveBit = bit(idx)
+            guard (remaining & moveBit) != 0 else { continue }
+
+            remaining &= ~moveBit
+
+            let next = applying(moveIndex: idx, player: player, position: position)
+            let score = searchTimed(position: next, player: player.toggle(), depth: depth - 1, aiPlayer: aiPlayer, alpha: a, beta: b, tt: &tt, deadline: deadline, didTimeout: &didTimeout)
+
+            if player == aiPlayer {
+                if score > bestScore {
+                    bestScore = score
+                    bestMove = idx
+                }
+
+                a = max(a, bestScore)
+                if a >= b { break }
+            } else {
+                if score < bestScore {
+                    bestScore = score
+                    bestMove = idx
+                }
+
+                b = min(b, bestScore)
+                if a >= b { break }
+            }
+
+            if remaining == 0 { break }
+        }
+
+        if didTimeout {
+            return bestScore
+        }
+
+        let flag: TTFlag
+
+        if bestScore <= a0 {
+            flag = .upper
+        } else if bestScore >= b0 {
+            flag = .lower
+        } else {
+            flag = .exact
+        }
+
+        tt[key] = TTEntry(depth: depth, score: bestScore, flag: flag, bestMove: bestMove)
+
+        return bestScore
+    }
     
     static func bestMoveSerial(for player: CellState, depth: Int, position: Position, moves: UInt64) -> Int? {
         var bestScore = Int.min
@@ -574,5 +727,116 @@ struct OthelloEngine {
             
             return bestMove
         }
+    }
+
+    struct TimedSearchResult {
+        var move: Int?
+        var completed: Bool
+    }
+
+    static func bestMoveParallelTimed(for player: CellState, depth: Int, position: Position, moves: UInt64, deadline: SearchDeadline) async -> TimedSearchResult {
+        if moves == 0 { return TimedSearchResult(move: nil, completed: true) }
+        if isExpired(deadline) { return TimedSearchResult(move: nil, completed: false) }
+
+        let alpha = Int.min / 2
+        let beta = Int.max / 2
+
+        return await withTaskGroup(of: (Int, Int, Bool).self) { group in
+            var remaining = moves
+            var moveTaskCount = 0
+            let timeoutNanoseconds = remainingNanoseconds(until: deadline)
+
+            group.addTask {
+                if timeoutNanoseconds > 0 {
+                    try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+                }
+                return (Int.min, -1, true)
+            }
+
+            for idx in moveOrder {
+                if isExpired(deadline) { break }
+
+                let mb = bit(idx)
+                guard (remaining & mb) != 0 else { continue }
+                remaining &= ~mb
+
+                group.addTask {
+                    var tt: [TTKey: TTEntry] = [:]
+                    tt.reserveCapacity(1 << 14)
+
+                    var timedOut = false
+                    let next = applying(moveIndex: idx, player: player, position: position)
+                    let score = searchTimed(position: next, player: player.toggle(), depth: depth - 1, aiPlayer: player, alpha: alpha, beta: beta, tt: &tt, deadline: deadline, didTimeout: &timedOut)
+                    return (score, idx, timedOut)
+                }
+                moveTaskCount += 1
+
+                if remaining == 0 { break }
+            }
+
+            var bestScore = Int.min
+            var bestMove: Int?
+            var completed = true
+
+            var completedMoveTasks = 0
+
+            while let (score, move, timedOut) = await group.next() {
+                if timedOut, move == -1 {
+                    completed = false
+                    group.cancelAll()
+                    break
+                }
+
+                completedMoveTasks += 1
+                if timedOut { completed = false }
+
+                if score > bestScore {
+                    bestScore = score
+                    bestMove = move
+                }
+
+                if isExpired(deadline) {
+                    completed = false
+                    group.cancelAll()
+                    break
+                }
+
+                if completedMoveTasks >= moveTaskCount {
+                    group.cancelAll()
+                    break
+                }
+            }
+
+            return TimedSearchResult(move: bestMove, completed: completed)
+        }
+    }
+
+    static func bestMoveTimed(for player: CellState, on board: [CellState], seconds: TimeInterval = 9.0) async -> Int? {
+        let position = position(from: board)
+        let moves = legalMoves(player: player, position: position)
+
+        guard moves != 0 else { return nil }
+
+        let deadline = makeDeadline(seconds: seconds)
+        var bestMove: Int?
+        var depth = 1
+        let maxDepth = 64
+
+        while depth <= maxDepth {
+            if isExpired(deadline) { break }
+            let result = await bestMoveParallelTimed(for: player, depth: depth, position: position, moves: moves, deadline: deadline)
+            if result.completed, let move = result.move {
+                bestMove = move
+            } else {
+                break
+            }
+            depth += 1
+        }
+
+        if bestMove == nil {
+            return bestMoveSerial(for: player, depth: 1, position: position, moves: moves)
+        }
+
+        return bestMove
     }
 }
