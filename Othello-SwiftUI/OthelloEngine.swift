@@ -310,6 +310,19 @@ struct OthelloEngine {
         
         return result
     }
+
+    static func orderedMoveIndices(from moves: UInt64) -> [Int] {
+        guard moves != 0 else { return [] }
+
+        var result: [Int] = []
+        result.reserveCapacity(moves.nonzeroBitCount)
+
+        for idx in moveOrder where (moves & bit(idx)) != 0 {
+            result.append(idx)
+        }
+
+        return result
+    }
     
     @inline(__always)
     static func terminalScore(position: Position, aiPlayer: CellState) -> Int {
@@ -459,18 +472,9 @@ struct OthelloEngine {
             }
         }
         
-        var remaining = moves
+        let orderedMoves = orderedMoveIndices(from: moves)
         
-        if bestMove != -1 {
-            remaining &= ~bit(bestMove)
-        }
-        
-        for idx in moveOrder {
-            let moveBit = bit(idx)
-            guard (remaining & moveBit) != 0 else { continue }
-            
-            remaining &= ~moveBit
-            
+        for idx in orderedMoves where idx != bestMove {
             let next = applying(moveIndex: idx, player: player, position: position)
             let score = search(position: next, player: player.toggle(), depth: depth - 1, aiPlayer: aiPlayer, alpha: a, beta: b, tt: &tt)
             
@@ -491,8 +495,6 @@ struct OthelloEngine {
                 b = min(b, bestScore)
                 if a >= b { break }
             }
-            
-            if remaining == 0 { break }
         }
         
         let flag: TTFlag
@@ -580,23 +582,14 @@ struct OthelloEngine {
             }
         }
 
-        var remaining = moves
+        let orderedMoves = orderedMoveIndices(from: moves)
 
-        if bestMove != -1 {
-            remaining &= ~bit(bestMove)
-        }
-
-        for idx in moveOrder {
+        for idx in orderedMoves where idx != bestMove {
             if didTimeout || Task.isCancelled || isExpired(deadline) {
                 didTimeout = true
                 return bestScore
             }
-
-            let moveBit = bit(idx)
-            guard (remaining & moveBit) != 0 else { continue }
-
-            remaining &= ~moveBit
-
+            
             let next = applying(moveIndex: idx, player: player, position: position)
             let score = searchTimed(position: next, player: player.toggle(), depth: depth - 1, aiPlayer: aiPlayer, alpha: a, beta: b, tt: &tt, deadline: deadline, didTimeout: &didTimeout)
 
@@ -618,7 +611,6 @@ struct OthelloEngine {
                 if a >= b { break }
             }
 
-            if remaining == 0 { break }
         }
 
         if didTimeout {
@@ -650,14 +642,9 @@ struct OthelloEngine {
         var a = Int.min / 2
         let b = Int.max / 2
         
-        var remaining = moves
+        let orderedMoves = orderedMoveIndices(from: moves)
         
-        for idx in moveOrder {
-            let mb = bit(idx)
-            
-            guard (remaining & mb) != 0 else { continue }
-            remaining &= ~mb
-            
+        for idx in orderedMoves {
             let next = applying(moveIndex: idx, player: player, position: position)
             
             let score: Int
@@ -674,8 +661,6 @@ struct OthelloEngine {
             }
             
             a = max(a, bestScore)
-            
-            if remaining == 0 { break }
         }
         
         return bestMove
@@ -696,13 +681,9 @@ struct OthelloEngine {
         let beta = Int.max / 2
         
         return await withTaskGroup(of: (Int, Int).self) { group in
-            var remaining = moves
+            let orderedMoves = orderedMoveIndices(from: moves)
             
-            for idx in moveOrder {
-                let mb = bit(idx)
-                guard (remaining & mb) != 0 else { continue }
-                remaining &= ~mb
-                
+            for idx in orderedMoves {
                 group.addTask {
                     var tt: [TTKey: TTEntry] = [:]
                     tt.reserveCapacity(1 << 14)
@@ -711,8 +692,6 @@ struct OthelloEngine {
                     let score = search(position: next, player: player.toggle(), depth: depth - 1, aiPlayer: player, alpha: alpha, beta: beta, tt: &tt)
                     return (score, idx)
                 }
-                
-                if remaining == 0 { break }
             }
             
             var bestScore = Int.min
@@ -742,7 +721,7 @@ struct OthelloEngine {
         let beta = Int.max / 2
 
         return await withTaskGroup(of: (Int, Int, Bool).self) { group in
-            var remaining = moves
+            let orderedMoves = orderedMoveIndices(from: moves)
             var moveTaskCount = 0
             let timeoutNanoseconds = remainingNanoseconds(until: deadline)
 
@@ -753,13 +732,9 @@ struct OthelloEngine {
                 return (Int.min, -1, true)
             }
 
-            for idx in moveOrder {
+            for idx in orderedMoves {
                 if isExpired(deadline) { break }
-
-                let mb = bit(idx)
-                guard (remaining & mb) != 0 else { continue }
-                remaining &= ~mb
-
+                
                 group.addTask {
                     var tt: [TTKey: TTEntry] = [:]
                     tt.reserveCapacity(1 << 14)
@@ -770,8 +745,6 @@ struct OthelloEngine {
                     return (score, idx, timedOut)
                 }
                 moveTaskCount += 1
-
-                if remaining == 0 { break }
             }
 
             var bestScore = Int.min
@@ -779,6 +752,11 @@ struct OthelloEngine {
             var completed = true
 
             var completedMoveTasks = 0
+
+            if moveTaskCount == 0 {
+                group.cancelAll()
+                return TimedSearchResult(move: nil, completed: false)
+            }
 
             while let (score, move, timedOut) = await group.next() {
                 if timedOut, move == -1 {
@@ -822,8 +800,7 @@ struct OthelloEngine {
         var depth = 1
         let maxDepth = 64
 
-        while depth <= maxDepth {
-            if isExpired(deadline) { break }
+        while depth <= maxDepth && !isExpired(deadline) {
             let result = await bestMoveParallelTimed(for: player, depth: depth, position: position, moves: moves, deadline: deadline)
             if result.completed, let move = result.move {
                 bestMove = move

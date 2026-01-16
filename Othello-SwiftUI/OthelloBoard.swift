@@ -40,17 +40,6 @@ struct OthelloBoard: View {
     @State private var isAIMoving = false
     @State private var gameId = 0
     
-    private let directions = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
-    private let positionWeights = [
-        120, -20, 20, 5, 5, 20, -20, 120,
-        -20, -40, -5, -5, -5, -5, -40, -20,
-        20, -5, 15, 3, 3, 15, -5, 20,
-        5, -5, 3, 3, 3, 3, -5, 5,
-        5, -5, 3, 3, 3, 3, -5, 5,
-        20, -5, 15, 3, 3, 15, -5, 20,
-        -20, -40, -5, -5, -5, -5, -40, -20,
-        120, -20, 20, 5, 5, 20, -20, 120
-    ]
     
     var body: some View {
         VStack {
@@ -430,11 +419,7 @@ struct OthelloBoard: View {
         }
     }
     
-    func isGameOver(on board: [CellState]) -> Bool {
-        hasAnyMove(for: .black, on: board) == false && hasAnyMove(for: .white, on: board) == false
-    }
-
-    func updateMaxThinkTime(for player: CellState, elapsed: Double) {
+    private func updateMaxThinkTime(for player: CellState, elapsed: Double) {
         if player == .black {
             maxThinkTimeBlack = max(maxThinkTimeBlack, elapsed)
         } else if player == .white {
@@ -442,98 +427,8 @@ struct OthelloBoard: View {
         }
     }
 
-    func timeString(_ seconds: Double) -> String {
+    private func timeString(_ seconds: Double) -> String {
         String(format: "%.2fs", seconds)
-    }
-    
-    func evaluate(board: [CellState], for player: CellState) -> Int {
-        var score = 0
-        
-        for index in board.indices {
-            switch board[index] {
-            case player:
-                score += positionWeights[index]
-                
-            case player.toggle():
-                score -= positionWeights[index]
-                
-            default:
-                break
-            }
-        }
-        
-        let mobility = validMoves(for: player, on: board).count - validMoves(for: player.toggle(), on: board).count
-        score += mobility * 4
-        
-        let counts = countPieces(on: board)
-        let pieceDiff = player == .black ? (counts.black - counts.white) : (counts.white - counts.black)
-        score += pieceDiff
-        
-        return score
-    }
-    
-    func bestMove(for player: CellState, depth: Int, on board: [CellState]) -> Int? {
-        let moves = validMoves(for: player, on: board)
-        guard moves.isEmpty == false else { return nil }
-        
-        var bestScore = Int.min
-        var bestMove: Int?
-        var alpha = Int.min / 2
-        let beta = Int.max / 2
-        
-        for move in moves {
-            let nextBoard = boardAfterMove(at: move, player: player, on: board)
-            let score = minimax(board: nextBoard, player: player.toggle(), depth: depth - 1, aiPlayer: player, alpha: alpha, beta: beta)
-            
-            if score > bestScore {
-                bestScore = score
-                bestMove = move
-            }
-            
-            alpha = max(alpha, bestScore)
-        }
-        
-        return bestMove
-    }
-    
-    func minimax(board: [CellState], player: CellState, depth: Int, aiPlayer: CellState, alpha: Int, beta: Int) -> Int {
-        if depth <= 0 || isGameOver(on: board) {
-            return evaluate(board: board, for: aiPlayer)
-        }
-        
-        let moves = validMoves(for: player, on: board)
-        
-        if moves.isEmpty {
-            return minimax(board: board, player: player.toggle(), depth: depth - 1, aiPlayer: aiPlayer, alpha: alpha, beta: beta)
-        }
-        
-        if player == aiPlayer {
-            var value = Int.min
-            var localAlpha = alpha
-            
-            for move in moves {
-                let nextBoard = boardAfterMove(at: move, player: player, on: board)
-                let score = minimax(board: nextBoard, player: player.toggle(), depth: depth - 1, aiPlayer: aiPlayer, alpha: localAlpha, beta: beta)
-                value = max(value, score)
-                localAlpha = max(localAlpha, value)
-                if localAlpha >= beta { break }
-            }
-            
-            return value
-        } else {
-            var value = Int.max
-            var localBeta = beta
-            
-            for move in moves {
-                let nextBoard = boardAfterMove(at: move, player: player, on: board)
-                let score = minimax(board: nextBoard, player: player.toggle(), depth: depth - 1, aiPlayer: aiPlayer, alpha: alpha, beta: localBeta)
-                value = min(value, score)
-                localBeta = min(localBeta, value)
-                if alpha >= localBeta { break }
-            }
-            
-            return value
-        }
     }
 }
 
